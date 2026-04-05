@@ -1,274 +1,524 @@
-#include <VarSpeedServo.h>
+/*
+ *  CONTROL DE PROCESO - Arduino UNO
+ *  Motor: 28BYJ-48 + Driver ULN2003
+ *  LIBRERÍAS REQUERIDAS:
+ *    - Adafruit SSD1306
+ *    - Adafruit GFX Library
+ *    - AccelStepper
+ *    - Servo (incluida en Arduino IDE)
+ *
+ *  CONEXIONES:
+ *    ULN2003  IN1→8  IN2→9  IN3→10  IN4→11  (VCC 5V externo)
+ *    Servo    Señal→6  (VCC 5V externo)
+ *    OLED     SDA→A4  SCL→A5
+ *    IR 1     → Pin 2  (LOW = detecta)
+ *    IR 2     → Pin 3  (LOW = detecta)
+ *    STOP     → Pin 4  (INPUT_PULLUP, LOW = presionado)
+ *    SALIDA   → Pin 13 (señal al Slave: pulso 500ms = inicio,
+ *                        HIGH sostenido = emergencia, LOW = libre)
+ *    REARME   → Pin 7  (INPUT_PULLUP, LOW = presionado)
+ *    SEGURIDAD→ Pin 12 (INPUT_PULLUP, LOW = zona ocupada) ← PRIORIDAD ABSOLUTA
+ *
+ *  PROTOCOLO PIN 13 → SLAVE (sin cable nuevo):
+ *    - Pulso HIGH 500 ms  : orden de inicio (igual que antes)
+ *    - HIGH sostenido     : emergencia activa
+ *    - Vuelve a LOW       : emergencia liberada / REARME
+ */
 
-VarSpeedServo servoBase, servoHombro, servoCodo, servoPinza, servoAGV;
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <AccelStepper.h>
+#include <Servo.h>
 
-const int Master_signal = 2;
-const int release_agv   = 5;
+// ── OLED ────────────────────────────────────────────────────
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDR    0x3C
 
-const int servoBasePin   = 9;
-const int servoHombroPin = 3;
-const int servoCodoPin   = 11;
-const int servoPinzaPin  = 6;
+// ── Pines ────────────────────────────────────────────────────
+const int MOTOR_IN1       = 8;
+const int MOTOR_IN2       = 9;
+const int MOTOR_IN3       = 10;
+const int MOTOR_IN4       = 11;
+const int IR_1_PIN        = 2;
+const int IR_2_PIN        = 3;
+const int STOP_PIN        = 4;
+const int SERVO_PIN       = 6;
+const int REARME_PIN      = 7;
+const int Security_sensor = 12;
+const int Signal_to_robot = 13;
 
-// ── NUEVO estado añadido ─────────────────────────────────────
-// EMERGENCIA_FREEZE: el brazo se detiene en la posición actual y
-// espera a que el Master baje la señal (REARME) antes de volver
-// a posición de reposo. No se añade ningún GPIO nuevo; se reutiliza
-// Master_signal con el siguiente protocolo:
-//   - Pulso HIGH ≤ 500 ms → orden de inicio (igual que antes)
-//   - HIGH sostenido > EMERGENCY_THRESHOLD ms → emergencia: freeze
-//   - Flanco de bajada (HIGH→LOW) estando frozen → ir a reposo
-enum BrazoEstado {
-  REPOSO,
-  YENDO_A_RECOGER,
-  CERRANDO_PINZA,
-  YENDO_A_COLOCAR,
-  ABRIENDO_PINZA,
-  VOLVIENDO_A_REPOSO,
-  ESPERANDO,
-  EMERGENCIA_FREEZE    // ← NUEVO
-};
+// ── Parámetros stepper 28BYJ-48 (half-step) ─────────────────
+const long  STEPS_PER_REV     = 4096;
+const long  STEPS_PER_QUARTER = STEPS_PER_REV / 4;
+const float STEPPER_SPEED     = 100;
+const float STEPPER_ACCEL     = 350.0;
 
-BrazoEstado estadoActual    = REPOSO;
-BrazoEstado estadoSiguiente = REPOSO;
+// ── Parámetros servo ─────────────────────────────────────────
+const int  SERVO_REPOSO  =   0;
+const int  SERVO_ACCION  =  90;
+const long SERVO_HOLD_MS = 400;
+const long SERVO_BACK_MS = 300;
 
-const int posReposo[4]      = {84,  55, 180,  180};
-const int posRecoger[4]     = {84, 75, 110,  180};
-const int posCerrarPinza[4] = {84, 105, 110,   50};
-const int posGetOut[4]      = {0,   65, 180,   50};
-const int posColocar[4]     = {0,   80, 150,   50};
+// ── Timers ───────────────────────────────────────────────────
+const long SIGNAL_DURATION_MS = 500;
+const long OLED_REFRESH_MS    = 150;
+const long IR_DEBOUNCE_MS     =  30;
+const unsigned long time_to_idle = 8000;
 
-unsigned long tiempoAnterior  = 0;
-unsigned long t_release_agv   = 0;
-unsigned long t_return_agv    = 0;
-const unsigned long delay_release        = 2000;
-const unsigned long delay_return         = 6000;
-const unsigned long tiempoEsperaPinza   = 800;
-const unsigned long tiempoEntreEstados  = 2500;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+AccelStepper stepper(AccelStepper::HALF4WIRE, MOTOR_IN1, MOTOR_IN3, MOTOR_IN2, MOTOR_IN4);
+Servo miServo;
 
-// ── Umbral para distinguir pulso de inicio vs. emergencia ────
-// El pulso de inicio dura 500 ms; cualquier HIGH que supere este
-// umbral se interpreta como emergencia sostenida del Master.
-const unsigned long EMERGENCY_THRESHOLD = 700;
+// ── Estados ──────────────────────────────────────────────────
+enum EstadoPrincipal { 
+  ST_IDLE,
+  ST_PROCESO,
+  ST_EMERGENCIA };
+  
+EstadoPrincipal estadoPrincipal = ST_IDLE;
 
-bool senalRecibida        = false;
-bool prevSenalRecibida    = false;   // ← NUEVO: detección de flancos
-unsigned long tSignalHigh = 0;       // ← NUEVO: marca el flanco de subida
-bool servosDetenidos      = false;
-bool pinzaDetenida        = false;
-bool tiempoEsperaCumplido = false;
-bool tiempoEstadoCumplido = false;
-bool estado_cambiado      = false;
-bool pending_release_agv  = false;
-bool pending_return_agv   = false;
-bool emergencyRecovery    = false;   // ← NUEVO: omite release AGV al recuperar
+enum EstadoServo     { 
+  SRV_REPOSO,
+  SRV_YENDO, 
+  SRV_VOLVIENDO };
 
-void readInputs() {
-  senalRecibida = digitalRead(Master_signal) == HIGH;
+EstadoServo     estadoServo     = SRV_REPOSO;
 
-  // ── Detección de flanco de subida para timestamp ─────────
-  if (senalRecibida && !prevSenalRecibida) {
-    tSignalHigh = millis();          // registrar cuándo subió la señal
-  }
-  prevSenalRecibida = senalRecibida;
-  // ─────────────────────────────────────────────────────────
+// ── Variables de proceso ─────────────────────────────────────
+long posicionObjetivo = 0;
+long proximoServo     = 0;
+int  accionesServo    = 0;
 
-  servosDetenidos      = !servoBase.isMoving() && !servoHombro.isMoving() && !servoCodo.isMoving();
-  pinzaDetenida        = !servoPinza.isMoving();
-  tiempoEsperaCumplido = millis() - tiempoAnterior >= tiempoEsperaPinza;
-  tiempoEstadoCumplido = millis() - tiempoAnterior >= tiempoEntreEstados;
+// ── Timers no bloqueantes ────────────────────────────────────
+unsigned long tServo          = 0;
+unsigned long tOled           = 0;
+unsigned long tSignal         = 0;
+unsigned long tIrDebounce     = 0;
+unsigned long tEmergParpadeo  = 0;
+unsigned long tRearmeDebounce = 0;
+unsigned long tStopDebounce   = 0;
+
+// ── Flags ────────────────────────────────────────────────────
+bool senal_activa     = false;
+bool ir_candidato     = false;
+bool parpadeoInvert   = false;
+bool rearme_candidato = false;
+bool stop_candidato   = false;
+bool estado_cambiado  = false;
+
+// ── NUEVAS FLAGS PARA SEGURIDAD (MODELO) ─────────────────────
+bool emergencyStopped = false;      // Latch para emergencia
+bool lastSegState     = LOW;        // Estado anterior del sensor de seguridad
+bool lastStopState    = HIGH;       // Estado anterior del botón STOP
+bool lastRearmeState  = HIGH;       // Estado anterior del botón REARME
+
+// ── Cache pantalla ───────────────────────────────────────────
+int  ultimo_porcentaje   = -1;
+int  ultimas_acciones    = -1;
+bool ultimo_servo_activo = false;
+
+// ── Entradas ─────────────────────────────────────────────────
+bool read_ir1       = false;
+bool read_ir2       = false;
+bool read_stop      = false;
+bool read_rearme    = false;
+bool read_seguridad = false;
+
+void apagarBobinas() {
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+  digitalWrite(MOTOR_IN3, LOW);
+  digitalWrite(MOTOR_IN4, LOW);
 }
 
-void irAlSiguienteEstado(BrazoEstado siguiente) {
-  estadoSiguiente = siguiente;
-  estadoActual    = ESPERANDO;
-  tiempoAnterior  = millis();
+void detenerTodo() {
+  // Detener motor
+  stepper.stop();
+  stepper.setSpeed(0);
+  apagarBobinas();
+  
+  // Retornar servo a posición de reposo
+  miServo.write(SERVO_REPOSO);
+  
+  // Señal de emergencia al Slave (HIGH sostenido)
+  digitalWrite(Signal_to_robot, HIGH);
+  senal_activa = false;  // Cancelar cualquier pulso pendiente
+  
+  Serial.println(F("EMERGENCIA ACTIVADA - Sistema detenido"));
+}
+
+void dibujarIdle() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(20, 4);
+  display.print(F("SYSTEM"));
+  display.drawLine(0, 24, 127, 24, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(28, 30);
+  display.print(F("Current State:"));
+  display.setTextSize(2);
+  display.setCursor(34, 44);
+  display.print(F("IDLE"));
+  display.display();
+}
+
+void dibujarIdleZonaOcupada() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(20, 4);
+  display.print(F("SYSTEM"));
+  display.drawLine(0, 24, 127, 24, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(16, 30);
+  display.print(F("ZONE OCCUPIED"));
+  display.setCursor(8, 44);
+  display.print(F("Check zone is clear"));
+  display.setCursor(8, 55);
+  display.print(F("and press RESET"));
+  display.display();
+}
+
+void dibujarProceso(int porcentaje, int acciones, bool servoActivo) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(4, 2);
+  display.print(F("OPERATION IN PROCESS"));
+  display.drawLine(0, 12, 127, 12, SSD1306_WHITE);
+  display.setCursor(4, 16);
+  display.print(F("Progress: "));
+  display.print(porcentaje);
+  display.print(F("%"));
+  int barW = map(porcentaje, 0, 100, 0, 118);
+  display.drawRect(4, 26, 120, 10, SSD1306_WHITE);
+  if (barW > 0) display.fillRect(5, 27, barW, 8, SSD1306_WHITE);
+  display.setCursor(4, 42);
+  display.print(F("Servo: "));
+  display.print(acciones);
+  display.print(F("/4"));
+  display.setCursor(68, 42);
+  display.print(servoActivo ? F("[ACTIVE]") : F("[waiting]"));
+  display.setCursor(4, 54);
+  display.print(F("Motor: "));
+  display.print(servoActivo ? F("Paused ") : F("Running"));
+  display.display();
+}
+
+void dibujarEmergencia(bool invertido) {
+  display.clearDisplay();
+  if (invertido) {
+    display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setTextSize(2);
+  display.setCursor(4, 4);
+  display.print(F("EMERGENCY"));
+  display.setCursor(16, 26);
+  display.print(F("  STOP!"));
+  display.setTextSize(1);
+  display.setCursor(6, 45);
+  display.print(F("Pulse RESET to go to IDLE"));
+  display.display();
+}
+
+void iniciarProceso() {
+  accionesServo  = 0;
+  estadoServo    = SRV_REPOSO;
+  senal_activa   = false;
+
+  stepper.setMaxSpeed(STEPPER_SPEED);
+  stepper.setAcceleration(STEPPER_ACCEL);
+  stepper.setCurrentPosition(0);
+
+  posicionObjetivo = STEPS_PER_REV;
+  proximoServo     = 0;
+  stepper.moveTo(posicionObjetivo);
+
+  ultimo_porcentaje   = -1;
+  ultimas_acciones    = -1;
+  ultimo_servo_activo = false;
+
+  estadoPrincipal = ST_PROCESO;
+  estado_cambiado = true;
+}
+
+void readInputs() {
+  // Lectura de entradas físicas
+  read_ir1       = digitalRead(IR_1_PIN)        == LOW;
+  read_ir2       = digitalRead(IR_2_PIN)        == LOW;
+  read_seguridad = digitalRead(Security_sensor) == LOW;
+  
+  // ── NUEVO: Manejo de STOP con latch (como modelo) ─────────
+  bool currentStopState = digitalRead(STOP_PIN);
+  if (currentStopState == LOW && lastStopState == HIGH) {
+    emergencyStopped = true;
+    Serial.println(F("STOP presionado - Emergencia activada"));
+  }
+  lastStopState = currentStopState;
+  
+  // ── NUEVO: Sensor seguridad con latch (como modelo) ────────
+  if (read_seguridad && !lastSegState) {
+    emergencyStopped = true;
+    Serial.println(F("Sensor seguridad: zona ocupada!"));
+  }
+  lastSegState = read_seguridad;
+  
+  // ── NUEVO: Botón REARME solo si zona despejada (como modelo) ─
+  bool currentRearmeState = digitalRead(REARME_PIN);
+  if (currentRearmeState == LOW && lastRearmeState == HIGH && !read_seguridad) {
+    emergencyStopped = false;
+    Serial.println(F("REARME - Emergencia liberada"));
+  }
+  lastRearmeState = currentRearmeState;
+  
+  // La variable read_stop ahora refleja el estado de emergencia
+  read_stop = emergencyStopped;
+  
+  // Lectura de REARME original (para compatibilidad, aunque ahora usamos el latch)
+  read_rearme = digitalRead(REARME_PIN) == LOW;
 }
 
 void updateStates() {
+  unsigned long ahora = millis();
 
-  // ── PRIORIDAD 1: Detectar emergencia (HIGH sostenido) ────────
-  // Se activa en cualquier estado activo (no REPOSO, no ya frozen).
-  // El estado REPOSO queda excluido porque ahí HIGH = inicio normal,
-  // y si persiste, la máquina pasa a ESPERANDO donde sí se detecta.
-  if (senalRecibida &&
-      millis() - tSignalHigh >= EMERGENCY_THRESHOLD &&
-      estadoActual != EMERGENCIA_FREEZE &&
-      estadoActual != REPOSO) {
-
-    servoBase.stop();
-    servoHombro.stop();
-    servoCodo.stop();
-    servoPinza.stop();
-    pending_release_agv = false;    // cancelar AGV pendiente
-    pending_return_agv  = false;
-    emergencyRecovery   = true;     // no relanzar AGV al recuperar
-    estadoActual        = EMERGENCIA_FREEZE;
-    estado_cambiado     = true;
-    Serial.println("FREEZE: detenido. Esperando REARME del Master...");
-    return;
-  }
-
-  // ── PRIORIDAD 2: Detectar REARME (flanco de bajada) ─────────
-  // Solo mientras está frozen. El Master baja la señal al rearmar.
-  if (!senalRecibida && estadoActual == EMERGENCIA_FREEZE) {
-    Serial.println("REARME recibido. Volviendo a reposo...");
-    estadoActual    = VOLVIENDO_A_REPOSO;
+  // ── PRIORIDAD ABSOLUTA: STOP/SEGURIDAD (como modelo) ───────
+  if (estadoPrincipal != ST_EMERGENCIA && read_stop) {
+    detenerTodo();
+    estadoPrincipal = ST_EMERGENCIA;
+    estadoServo     = SRV_REPOSO;
+    parpadeoInvert  = false;
+    tEmergParpadeo  = ahora;
     estado_cambiado = true;
     return;
   }
 
-  // ── Máquina de estados normal ────────────────────────────────
-  switch (estadoActual) {
+  switch (estadoPrincipal) {
 
-    case REPOSO:
-      if (senalRecibida) {
-        Serial.println("Señal recibida. Iniciando...");
-        irAlSiguienteEstado(YENDO_A_RECOGER);
-      }
-      break;
-
-    case YENDO_A_RECOGER:
-      if (servosDetenidos) {
-        Serial.println("En posición de recoger. Cerrando pinza...");
-        irAlSiguienteEstado(CERRANDO_PINZA);
-      }
-      break;
-
-    case CERRANDO_PINZA:
-      if (tiempoEsperaCumplido && pinzaDetenida) {
-        Serial.println("Pinza cerrada. Yendo a colocar...");
-        irAlSiguienteEstado(YENDO_A_COLOCAR);
-      }
-      break;
-
-    case YENDO_A_COLOCAR:
-      if (servosDetenidos) {
-        Serial.println("En posición de colocar. Abriendo pinza...");
-        irAlSiguienteEstado(ABRIENDO_PINZA);
-      }
-      break;
-
-    case ABRIENDO_PINZA:
-      if (tiempoEsperaCumplido && pinzaDetenida) {
-        Serial.println("Pinza abierta. Volviendo a reposo...");
-        irAlSiguienteEstado(VOLVIENDO_A_REPOSO);
-      }
-      break;
-
-    case VOLVIENDO_A_REPOSO:
-      if (servosDetenidos) {
-        Serial.println("En reposo.");
-        if (!emergencyRecovery) {
-          // Ciclo normal: liberar AGV
-          pending_release_agv = true;
-          t_release_agv       = millis();
-        }
-        emergencyRecovery = false;   // limpiar flag en cualquier caso
-        irAlSiguienteEstado(REPOSO);
-      }
-      break;
-
-    case ESPERANDO:
-      if (tiempoEstadoCumplido) {
-        estadoActual    = estadoSiguiente;
-        tiempoAnterior  = millis();
+    case ST_IDLE:
+      // Si zona ocupada, mostrar mensaje y no permitir inicio
+      if (read_seguridad) {
+        ir_candidato    = false;
         estado_cambiado = true;
-        servosDetenidos = false;
+        break;
+      }
+      // Solo permite inicio si zona despejada
+      if (read_ir1 && read_ir2) {
+        if (!ir_candidato) {
+          ir_candidato = true;
+          tIrDebounce  = ahora;
+        } else if (ahora - tIrDebounce >= IR_DEBOUNCE_MS) {
+          ir_candidato = false;
+          iniciarProceso();
+        }
+      } else {
+        ir_candidato = false;
       }
       break;
 
-    case EMERGENCIA_FREEZE:
-      // Espera pasiva: nada que hacer aquí.
-      // La salida de este estado la maneja PRIORIDAD 2 arriba.
+    case ST_PROCESO:
+      // Verificar emergencia durante proceso (redundante pero seguro)
+      if (read_stop) {
+        detenerTodo();
+        estadoPrincipal = ST_EMERGENCIA;
+        estadoServo     = SRV_REPOSO;
+        parpadeoInvert  = false;
+        tEmergParpadeo  = ahora;
+        estado_cambiado = true;
+        break;
+      }
+      
+      switch (estadoServo) {
+        case SRV_REPOSO:
+          if (accionesServo < 4 &&
+              stepper.currentPosition() >= proximoServo) {
+            stepper.stop();
+            estadoServo     = SRV_YENDO;
+            tServo          = ahora;
+            estado_cambiado = true;
+          } else {
+            stepper.run();
+          }
+          break;
+        case SRV_YENDO:
+          if (ahora - tServo >= SERVO_HOLD_MS) {
+            estadoServo     = SRV_VOLVIENDO;
+            tServo          = ahora;
+            estado_cambiado = true;
+          }
+          break;
+        case SRV_VOLVIENDO:
+          if (ahora - tServo >= SERVO_BACK_MS) {
+            accionesServo++;
+            estadoServo     = SRV_REPOSO;
+            estado_cambiado = true;
+            if (accionesServo < 4) {
+              proximoServo = stepper.currentPosition() + STEPS_PER_QUARTER;
+            }
+            stepper.moveTo(posicionObjetivo);
+          }
+          break;
+      }
+      if (estadoServo == SRV_REPOSO          &&
+          stepper.distanceToGo() == 0        &&
+          stepper.currentPosition() >= posicionObjetivo &&
+          accionesServo >= 4) {
+        stepper.stop();
+        apagarBobinas();
+        digitalWrite(Signal_to_robot, HIGH);
+        tSignal         = ahora;
+        senal_activa    = true;
+        estadoPrincipal = ST_IDLE;
+        estado_cambiado = true;
+        tOled           = 0;
+      }
+      break;
+
+    case ST_EMERGENCIA:
+      // Parpadeo para la pantalla
+      if (ahora - tEmergParpadeo >= 500) {
+        parpadeoInvert  = !parpadeoInvert;
+        tEmergParpadeo  = ahora;
+        estado_cambiado = true;
+      }
+      
+      // Salir de emergencia solo cuando read_stop sea false (ya liberado por REARME)
+      if (!read_stop) {
+        // Bajar la señal indica al Slave que la emergencia fue liberada
+        digitalWrite(Signal_to_robot, LOW);
+        senal_activa    = false;
+        estadoPrincipal = ST_IDLE;
+        estado_cambiado = true;
+        tOled           = 0;
+        
+        // Reiniciar variables de proceso
+        accionesServo     = 0;
+        estadoServo       = SRV_REPOSO;
+        ir_candidato      = false;
+        ultimo_porcentaje = -1;
+        ultimas_acciones  = -1;
+        stepper.setCurrentPosition(0);
+        miServo.write(SERVO_REPOSO);
+        apagarBobinas();
+        
+        Serial.println(F("Sistema reiniciado - Fuera de emergencia"));
+      }
       break;
   }
 
-  if (pending_release_agv && millis() - t_release_agv >= delay_release) {
-    pending_release_agv = false;
-    Serial.println("AGV moving out");
-    servoAGV.write(90);
-    pending_return_agv = true;
-    t_return_agv       = millis();
-  }
-  if (pending_return_agv && millis() - t_return_agv >= delay_return) {
-    pending_return_agv = false;
-    servoAGV.write(0);
-    Serial.println("AGV has moved out");
+  // Fin del pulso de inicio (500 ms)
+  if (senal_activa && (ahora - tSignal >= SIGNAL_DURATION_MS)) {
+    digitalWrite(Signal_to_robot, LOW);
+    senal_activa    = false;
+    estado_cambiado = true;
   }
 }
 
 void updateOutputs() {
-  if (!estado_cambiado) return;
+  unsigned long ahora = millis();
+
+  // Control del servo durante proceso
+  if (estadoPrincipal == ST_PROCESO && estado_cambiado) {
+    switch (estadoServo) {
+      case SRV_YENDO:     miServo.write(SERVO_ACCION);  break;
+      case SRV_VOLVIENDO: miServo.write(SERVO_REPOSO);  break;
+      case SRV_REPOSO:    miServo.write(SERVO_REPOSO);  break;
+    }
+  }
+
+  // Actualización de pantalla
+  if (estadoPrincipal == ST_PROCESO) {
+    if (ahora - tOled >= OLED_REFRESH_MS) {
+      long pasos       = constrain(stepper.currentPosition(), 0, STEPS_PER_REV);
+      int  porcentaje  = (int)((pasos * 100L) / STEPS_PER_REV);
+      bool servoActivo = (estadoServo != SRV_REPOSO);
+      bool hayCambio   = (porcentaje    != ultimo_porcentaje)  ||
+                         (accionesServo != ultimas_acciones)   ||
+                         (servoActivo   != ultimo_servo_activo);
+      if (hayCambio) {
+        dibujarProceso(porcentaje, accionesServo, servoActivo);
+        tOled               = ahora;
+        ultimo_porcentaje   = porcentaje;
+        ultimas_acciones    = accionesServo;
+        ultimo_servo_activo = servoActivo;
+      }
+    }
+    estado_cambiado = false;
+    return;
+  }
+
+  if (!estado_cambiado)                return;
+  if (ahora - tOled < OLED_REFRESH_MS) return;
   estado_cambiado = false;
+  tOled           = ahora;
 
-  switch (estadoActual) {
-
-    case REPOSO:
+  switch (estadoPrincipal) {
+    case ST_IDLE:
+      read_seguridad ? dibujarIdleZonaOcupada() : dibujarIdle();
       break;
-
-    case YENDO_A_RECOGER:
-      servoCodo.write(posRecoger[2],   20, true);
-      servoHombro.write(posRecoger[1], 20, true);
-      servoPinza.write(posRecoger[3],  40, true);
+    case ST_EMERGENCIA:
+      dibujarEmergencia(parpadeoInvert);
       break;
-
-    case CERRANDO_PINZA:
-      servoHombro.write(posCerrarPinza[1], 30, true);
-      servoPinza.write(posCerrarPinza[3], 30, true);
-      break;
-
-    case YENDO_A_COLOCAR:
-      servoHombro.write(posGetOut[1], 15, true);
-      servoCodo.write(posGetOut[2],   15, true);
-      servoBase.write(posColocar[0],   15, true);
-      break;
-
-    case ABRIENDO_PINZA:
-      servoHombro.write(posColocar[1], 40, true);
-      servoCodo.write(posColocar[2], 40, true);
-      servoPinza.write(posReposo[3], 40, true);
-      servoCodo.write(posReposo[2],   40, true);
-
-      break;
-
-    case VOLVIENDO_A_REPOSO:
-      servoBase.write(posReposo[0],   50, true);
-      servoHombro.write(posReposo[1], 50, true);
-      servoCodo.write(posReposo[2],   50, true);
-      break;
-
-    case EMERGENCIA_FREEZE:
-      // Los servos ya fueron detenidos con .stop() en updateStates().
-      // No se envía ningún movimiento nuevo: el brazo queda congelado
-      // en la posición que tenía al momento del STOP.
-      break;
-
-    case ESPERANDO:
+    default:
       break;
   }
 }
 
 void setup() {
   Serial.begin(9600);
-  pinMode(Master_signal, INPUT);
 
-  servoBase.attach(servoBasePin);
-  servoHombro.attach(servoHombroPin);
-  servoCodo.attach(servoCodoPin);
-  servoPinza.attach(servoPinzaPin);
-  servoAGV.attach(release_agv);
+  pinMode(IR_1_PIN,        INPUT_PULLUP);
+  pinMode(IR_2_PIN,        INPUT_PULLUP);
+  pinMode(STOP_PIN,        INPUT_PULLUP);
+  pinMode(REARME_PIN,      INPUT_PULLUP);
+  pinMode(Security_sensor, INPUT_PULLUP);
+  pinMode(Signal_to_robot, OUTPUT);
 
-  servoBase.write(posReposo[0],   30, true);
-  servoCodo.write(posReposo[2],   30, true);
-  servoHombro.write(posReposo[1], 30, true);
-  servoPinza.write(posReposo[3],  30, true);
-  servoAGV.write(0, 80, true);
+  digitalWrite(Signal_to_robot, LOW);
+
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  pinMode(MOTOR_IN3, OUTPUT);
+  pinMode(MOTOR_IN4, OUTPUT);
+  apagarBobinas();
+
+  miServo.attach(SERVO_PIN);
+  miServo.write(SERVO_REPOSO);
+
+  stepper.setMaxSpeed(STEPPER_SPEED);
+  stepper.setAcceleration(STEPPER_ACCEL);
+  stepper.setCurrentPosition(0);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    pinMode(LED_BUILTIN, OUTPUT);
+    while (true) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      for (volatile long i = 0; i < 30000L; i++);
+    }
+  }
+
+  display.clearDisplay();
+  display.display();
+  dibujarIdle();
+  tOled = millis();
+  
+  // Inicializar estados anteriores
+  lastStopState   = digitalRead(STOP_PIN);
+  lastRearmeState = digitalRead(REARME_PIN);
+  lastSegState    = digitalRead(Security_sensor) == LOW;
+  emergencyStopped = false;
+  
+  Serial.println(F("Maestro iniciado"));
 }
 
 void loop() {
   readInputs();
   updateStates();
   updateOutputs();
-  delay(10);
 }
