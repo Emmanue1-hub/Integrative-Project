@@ -44,14 +44,14 @@ VarSpeedServo servoBase, servoHombro, servoCodo, servoPinza;
 VarSpeedServo servoAGV;
 
 const int AGV_BLOQUEADO = 90;
-const int AGV_LIBERADO  =  180;
+const int AGV_LIBERADO  =  0;
 
 // ── Posiciones del brazo ──────────────────────────────────────
 const int posReposo[4]      = {180,  50, 180, 180};
 const int posRecoger[4]     = {170,  90, 160, 180};
-const int posCerrarPinza[4] = {170,  90, 145,  68};
-const int posGetOut[4]      = { 80,  51, 180,  68};
-const int posColocar[4]     = { 80,  65, 135,  68};
+const int posCerrarPinza[4] = {170,  90, 145,  55};
+const int posGetOut[4]      = { 80,  51, 180,  50};
+const int posColocar[4]     = { 80,  65, 135,  55};
 
 // ── Estados ───────────────────────────────────────────────────
 enum EsclavoEstado {
@@ -297,52 +297,36 @@ void updateOutputs() {
   switch (estadoBrazo) {
 
     case YENDO_A_RECOGER:
-      servoBase.write(posRecoger[0],   20, false);
-      servoBase.write(posRecoger[0],   20, false);
-      servoCodo.write(posRecoger[2],   20, false);
-      servoCodo.write(posRecoger[2],   20, false);
-      servoHombro.write(posRecoger[1], 25, false);
-      servoHombro.write(posRecoger[1], 25, false);
-      servoPinza.write(posRecoger[3],  15, false);
-      servoPinza.write(posRecoger[3],  15, false);
+      servoBase.write(posRecoger[0],   15, true);
+      servoCodo.write(posRecoger[2],   15, true);
+      servoHombro.write(posRecoger[1], 15, true);
+      servoPinza.write(posRecoger[3],  15, true);
       break;
 
     case CERRANDO_PINZA:
-      servoPinza.write(posCerrarPinza[3], 15, false);
-      servoPinza.write(posCerrarPinza[3], 15, false);
-      servoCodo.write(posGetOut[2], 20, false);
-      servoCodo.write(posGetOut[2], 20, false);
-      servoHombro.write(posGetOut[1], 20, false);
-      servoHombro.write(posGetOut[1], 20, false);
+      servoPinza.write(posCerrarPinza[3], 15, true);
+      servoCodo.write(posGetOut[2], 15, true);
+      servoHombro.write(posGetOut[1], 15, true);
       break;
 
     case YENDO_A_COLOCAR:
-      servoBase.write(posColocar[0],   20, false);
-      servoBase.write(posColocar[0],   20, false);
-      servoHombro.write(posColocar[1], 20, false);
-      servoHombro.write(posColocar[1], 20, false);
-      servoCodo.write(posColocar[2],   20, false);
-      servoCodo.write(posColocar[2],   20, false);
+      servoBase.write(posColocar[0],   15, true);
+      servoHombro.write(posColocar[1], 15, true);
+      servoCodo.write(posColocar[2],   15, true);
       break;
 
     case ABRIENDO_PINZA:
-      servoHombro.write(80, 25, false);
-      servoHombro.write(80, 25, false);
-      servoPinza.write(posReposo[3], 15, false);
-      servoPinza.write(posReposo[3], 15, false);
+      servoHombro.write(80, 15, true);
+      servoPinza.write(posReposo[3], 15, true);
       break;
 
     case VOLVIENDO_A_REPOSO:
-      servoHombro.write(posReposo[1], 20, false);
-      servoHombro.write(posReposo[1], 20, false);
-      servoCodo.write(posGetOut[2],   20, false);
-      servoCodo.write(posGetOut[2],   20, false);
-      servoBase.write(posReposo[0],   20, false);
-      servoBase.write(posReposo[0],   20, false);
-      servoHombro.write(posReposo[1], 25, false);
-      servoHombro.write(posReposo[1], 25, false);
-      servoPinza.write(posReposo[3],  15, false);
-      servoPinza.write(posReposo[3],  15, false);
+      servoHombro.write(posReposo[1], 15, true);
+      servoCodo.write(posGetOut[2],   15, true);
+
+      servoBase.write(posReposo[0],   15, true);
+      servoHombro.write(posReposo[1], 15, true);
+      servoPinza.write(posReposo[3],  15, true);
       break;
 
     case EMERGENCIA_FREEZE:
