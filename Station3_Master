@@ -350,11 +350,13 @@ void updateDisplay() {
 
   if (current == Stop) {
     display.setTextSize(2);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(10, 15);
+    display.setCursor(10, 4);
     display.println("EMERGENCY");
-    display.setCursor(40, 40);
+    display.setCursor(35, 26);
     display.println("STOP!");
+    display.setTextSize(1);
+    display.setCursor(6, 45);
+    display.print(F("Pulse RESET to go to IDLE"));
     display.display();
     return;
   }
@@ -402,12 +404,12 @@ void updateDisplay() {
   display.print(count_high);
 
   display.setTextSize(1);
-  display.setCursor(80, 15);
+  display.setCursor(70, 15);
   switch (current) {
     case IDLE:            display.print("IDLE");  break;
-    case BRAZO_ACTIVO:    display.print("BRAZO"); break;
-    case CLASIFICANDO:    display.print("CLAS");  break;
-    case BANDA_CORRIENDO: display.print("BANDA"); break;
+    case BRAZO_ACTIVO:    display.print("ROBOT ARM"); break;
+    case CLASIFICANDO:    display.print("CLASSIFY");  break;
+    case BANDA_CORRIENDO: display.print("CONVEYOR"); break;
     default: break;
   }
 
@@ -446,9 +448,6 @@ void setup() {
 
   // Inicializar prev_agv_signal con estado real del pin
   prev_agv_signal = (digitalRead(PIN_AGV_SIGNAL) == HIGH);
-
-  // Dar tiempo al Slave para terminar su setup
-  delay(2000);
 
   Serial.println(F("Maestro iniciado - V5"));
 }
